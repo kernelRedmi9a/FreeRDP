@@ -1070,6 +1070,29 @@ SdlRail* SdlContext::getRailContext()
 	return _rail.get();
 }
 
+void SdlContext::setRemoteAppMode(bool enabled)
+{
+	/* In RemoteApp mode RAIL windows replace the fullscreen desktop window. */
+	for (auto& [id, window] : _windows)
+	{
+		SDL_Window* win = window.window();
+		if (!win)
+			continue;
+		if (enabled)
+			SDL_HideWindow(win);
+		else
+			SDL_ShowWindow(win);
+	}
+}
+
+bool SdlContext::updateRailWorkArea()
+{
+	auto* rail = getRailContext();
+	if (!rail || !rail->isActive())
+		return true;
+	return rail->sendWorkArea();
+}
+
 SdlConnectionDialogWrapper& SdlContext::getDialog()
 {
 	return _dialog;
@@ -1203,6 +1226,18 @@ bool SdlContext::handleEvent(const SDL_DisplayEvent& ev)
 {
 	if (!getDisplayChannelContext().handleEvent(ev))
 		return false;
+
+	/* For RemoteApp, report a changed usable area to the server so maximized
+	 * windows honour the new work area (like _NET_WORKAREA in X11). */
+	switch (ev.type)
+	{
+		case SDL_EVENT_DISPLAY_USABLE_BOUNDS_CHANGED:
+			if (!updateRailWorkArea())
+				return false;
+			break;
+		default:
+			break;
+	}
 
 	switch (ev.type)
 	{

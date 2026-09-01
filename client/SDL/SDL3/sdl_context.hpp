@@ -134,6 +134,8 @@ class SdlContext
 	[[nodiscard]] SdlRail* initRail(RailClientContext* rail);
 	[[nodiscard]] bool uninitRail();
 	[[nodiscard]] SdlRail* getRailContext();
+	void setRemoteAppMode(bool enabled);
+	[[nodiscard]] bool updateRailWorkArea();
 
 	[[nodiscard]] SdlConnectionDialogWrapper& getDialog();
 

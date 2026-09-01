@@ -55,10 +55,24 @@ struct SdlRailWindow
 	INT32 windowClientDeltaX = 0;
 	INT32 windowClientDeltaY = 0;
 
+	INT32 visibleOffsetX = 0;
+	INT32 visibleOffsetY = 0;
+	std::vector<RECTANGLE_16> windowRects;
+
 	INT32 resizeMarginLeft = 0;
 	INT32 resizeMarginTop = 0;
 	INT32 resizeMarginRight = 0;
 	INT32 resizeMarginBottom = 0;
+
+	/* Client-side local move/resize tracking while the server has handed the
+	 * window to the client (RAIL_LOCALMOVESIZE_ORDER). */
+	INT32 localMoveDirection = 0;
+	float localMovePointerStartX = 0;
+	float localMovePointerStartY = 0;
+	INT32 localMoveStartX = 0;
+	INT32 localMoveStartY = 0;
+	INT32 localMoveStartW = 0;
+	INT32 localMoveStartH = 0;
 
 	/* Local window geometry (may diverge from the server requested one
 	 * when the user moves/resizes the window locally). */
@@ -98,6 +112,8 @@ class SdlRail
 	bool init(RailClientContext* rail);
 	bool uninit();
 
+	friend class SdlContext;
+
 	bool paint(const std::vector<SDL_Rect>& rects);
 	bool handleEvent(const SDL_WindowEvent& ev);
 
@@ -106,6 +122,7 @@ class SdlRail
 	bool handleMouseMotion(SDL_WindowID windowId, const SDL_MouseMotionEvent& ev);
 	bool handleMouseButton(SDL_WindowID windowId, const SDL_MouseButtonEvent& ev);
 	bool handleMouseWheel(SDL_WindowID windowId, const SDL_MouseWheelEvent& ev);
+	bool handleLocalMove(SdlRailWindow* railWin, const SDL_MouseMotionEvent& ev);
 
 	[[nodiscard]] bool isRailWindow(SDL_WindowID windowId) const;
 	[[nodiscard]] SdlRailWindow* getWindowForSdlWindow(SDL_WindowID windowId);
@@ -126,6 +143,7 @@ class SdlRail
 
 	bool enableRemoteAppMode();
 	bool disableRemoteAppMode();
+	bool sendWorkArea();
 
 	bool sendWindowMove(SdlRailWindow* railWin);
 	bool sendClientActivate(SdlRailWindow* railWin, bool enabled);
@@ -177,6 +195,7 @@ class SdlRail
 	RailClientContext* _rail = nullptr;
 	std::map<UINT64, std::unique_ptr<SdlRailWindow>> _windows;
 	std::map<UINT32, SDL_Surface*> _iconCache;
+	RECTANGLE_16 _workArea{};
 	mutable std::mutex _mutex;
 	bool _remoteAppActive = false;
 };

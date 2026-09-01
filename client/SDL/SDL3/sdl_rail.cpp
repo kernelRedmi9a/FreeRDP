@@ -31,6 +31,7 @@
 #include "sdl_context.hpp"
 #include "sdl_prefs.hpp"
 #include "sdl_types.hpp"
+#include "sdl_utils.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -162,6 +163,18 @@ bool SdlRail::enableRemoteAppMode()
 
 	WLog_Print(_sdl->getWLog(), WLOG_DEBUG, "Enabling RemoteApp mode");
 	_remoteAppActive = true;
+
+	/* Swap the fullscreen desktop window for the RAIL windows. suppressOutput is
+	 * only held during the swap, like in the X11 client: the desktop framebuffer
+	 * continues to receive GDI updates so RAIL windows can copy out of it. */
+	rdpGdi* gdi = _sdl->context()->gdi;
+	if (gdi)
+		gdi->suppressOutput = TRUE;
+
+	_sdl->setRemoteAppMode(true);
+
+	if (gdi)
+		gdi->suppressOutput = FALSE;
 	return true;
 }
 
@@ -173,11 +186,53 @@ bool SdlRail::disableRemoteAppMode()
 	WLog_Print(_sdl->getWLog(), WLOG_DEBUG, "Disabling RemoteApp mode");
 	_remoteAppActive = false;
 
+	rdpGdi* gdi = _sdl->context()->gdi;
+	if (gdi)
+		gdi->suppressOutput = TRUE;
+
+	_sdl->setRemoteAppMode(false);
+
+	if (gdi)
+		gdi->suppressOutput = FALSE;
+
 	std::lock_guard lock(_mutex);
 	for (auto& [id, win] : _windows)
 		destroySdlWindow(win.get());
 	_windows.clear();
 	clearIconCache();
+	return true;
+}
+
+bool SdlRail::sendWorkArea()
+{
+	if (!_rail || !_rail->ClientSystemParam)
+		return true;
+
+	/* Report the usable area of the display the window is on so the server
+	 * maximizes RemoteApp windows within the panel (like _NET_WORKAREA). */
+	SDL_Rect usable{};
+	const SDL_DisplayID display = SDL_GetPrimaryDisplay();
+	if (!SDL_GetDisplayUsableBounds(display, &usable))
+		return true;
+
+	const RECTANGLE_16 workArea = { WINPR_ASSERTING_INT_CAST(UINT16, usable.x),
+		                            WINPR_ASSERTING_INT_CAST(UINT16, usable.y),
+		                            WINPR_ASSERTING_INT_CAST(UINT16, usable.x + usable.w),
+		                            WINPR_ASSERTING_INT_CAST(UINT16, usable.y + usable.h) };
+
+	if (workArea.left == _workArea.left && workArea.top == _workArea.top &&
+	    workArea.right == _workArea.right && workArea.bottom == _workArea.bottom)
+		return true;
+
+	RAIL_SYSPARAM_ORDER sysparam = {};
+	sysparam.params = static_cast<UINT32>(SPI_MASK_SET_WORK_AREA);
+	sysparam.workArea = workArea;
+
+	WLog_Print(_sdl->getWLog(), WLOG_DEBUG, "RAIL sending work area %d,%d %dx%d", usable.x,
+	           usable.y, usable.w, usable.h);
+	const UINT rc = _rail->ClientSystemParam(_rail, &sysparam);
+	if (rc == CHANNEL_RC_OK)
+		_workArea = workArea;
 	return true;
 }
 
@@ -212,6 +267,8 @@ bool SdlRail::createSdlWindow(SdlRailWindow* railWin)
 	Uint32 flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
 	if (railWin->showState != WINDOW_SHOW_MINIMIZED)
 		flags |= SDL_WINDOW_RESIZABLE;
+	if (railWin->showState == WINDOW_HIDE)
+		flags |= SDL_WINDOW_HIDDEN;
 
 	int w = static_cast<int>(railWin->windowWidth);
 	int h = static_cast<int>(railWin->windowHeight);
@@ -236,6 +293,8 @@ bool SdlRail::createSdlWindow(SdlRailWindow* railWin)
 		SDL_MinimizeWindow(railWin->window);
 	else if (railWin->showState == WINDOW_SHOW_MAXIMIZED)
 		SDL_MaximizeWindow(railWin->window);
+	else if (railWin->showState == WINDOW_HIDE)
+		SDL_HideWindow(railWin->window);
 
 	if (railWin->minTrackWidth > 0 && railWin->minTrackHeight > 0)
 		SDL_SetWindowMinimumSize(railWin->window, railWin->minTrackWidth,
@@ -631,9 +690,86 @@ bool SdlRail::handleMouseMotion(SDL_WindowID windowId, const SDL_MouseMotionEven
 	if (!railWin || !_rail)
 		return true;
 
+	/* While the server has handed the window to the client for a local
+	 * move/resize, consume the motion and move the local window instead of
+	 * forwarding it to the RDP server. */
+	if (railWin->railMoveInProgress)
+		return handleLocalMove(railWin, ev);
+
 	const INT32 x = static_cast<INT32>(ev.x) + railWin->windowOffsetX;
 	const INT32 y = static_cast<INT32>(ev.y) + railWin->windowOffsetY;
 	return freerdp_client_send_button_event(_sdl->common(), FALSE, PTR_FLAGS_MOVE, x, y);
+}
+
+bool SdlRail::handleLocalMove(SdlRailWindow* railWin, WINPR_ATTR_UNUSED const SDL_MouseMotionEvent& ev)
+{
+	WINPR_ASSERT(railWin);
+	if (!railWin->window)
+		return true;
+
+	float gx = 0.0f;
+	float gy = 0.0f;
+	SDL_GetGlobalMouseState(&gx, &gy);
+	const INT32 dx = static_cast<INT32>(gx - railWin->localMovePointerStartX);
+	const INT32 dy = static_cast<INT32>(gy - railWin->localMovePointerStartY);
+
+	INT32 x = railWin->localMoveStartX;
+	INT32 y = railWin->localMoveStartY;
+	INT32 w = railWin->localMoveStartW;
+	INT32 h = railWin->localMoveStartH;
+
+	switch (railWin->localMoveDirection)
+	{
+		case RAIL_WMSZ_LEFT:
+			x += dx;
+			w -= dx;
+			break;
+		case RAIL_WMSZ_RIGHT:
+			w += dx;
+			break;
+		case RAIL_WMSZ_TOP:
+			y += dy;
+			h -= dy;
+			break;
+		case RAIL_WMSZ_TOPLEFT:
+			x += dx;
+			y += dy;
+			w -= dx;
+			h -= dy;
+			break;
+		case RAIL_WMSZ_TOPRIGHT:
+			y += dy;
+			w += dx;
+			h -= dy;
+			break;
+		case RAIL_WMSZ_BOTTOM:
+			h += dy;
+			break;
+		case RAIL_WMSZ_BOTTOMLEFT:
+			x += dx;
+			w -= dx;
+			h += dy;
+			break;
+		case RAIL_WMSZ_BOTTOMRIGHT:
+			w += dx;
+			h += dy;
+			break;
+		default:
+			/* RAIL_WMSZ_MOVE, KEYMOVE, KEYSIZE and anything else: move only.
+			 * (Keyboard moves are best effort, like the X11 client.) */
+			x += dx;
+			y += dy;
+			break;
+	}
+
+	if (w < 1)
+		w = 1;
+	if (h < 1)
+		h = 1;
+
+	SDL_SetWindowPosition(railWin->window, x, y);
+	SDL_SetWindowSize(railWin->window, w, h);
+	return true;
 }
 
 bool SdlRail::handleMouseWheel(SDL_WindowID windowId, const SDL_MouseWheelEvent& ev)
@@ -812,6 +948,22 @@ bool SdlRail::windowCommonHandler(rdpContext* ctx, const WINDOW_ORDER_INFO* orde
 		railWin->windowClientDeltaY = state->windowClientDeltaY;
 	}
 
+	if (fieldFlags & WINDOW_ORDER_FIELD_WND_RECTS)
+	{
+		railWin->windowRects.clear();
+		if (state->numWindowRects > 0 && state->windowRects)
+		{
+			railWin->windowRects.assign(state->windowRects,
+			                            state->windowRects + state->numWindowRects);
+		}
+	}
+
+	if (fieldFlags & WINDOW_ORDER_FIELD_VIS_OFFSET)
+	{
+		railWin->visibleOffsetX = state->visibleOffsetX;
+		railWin->visibleOffsetY = state->visibleOffsetY;
+	}
+
 	if (fieldFlags & WINDOW_ORDER_FIELD_SHOW)
 	{
 		railWin->isVisible =
@@ -830,23 +982,65 @@ bool SdlRail::windowCommonHandler(rdpContext* ctx, const WINDOW_ORDER_INFO* orde
 		}
 	}
 
+	/* Keep track of any position/size update so that we can force a refresh of
+	 * the window (like xf_rail_window_common does in the X11 client). */
+	const BOOL positionOrSizeUpdated =
+	    ((fieldFlags & WINDOW_ORDER_FIELD_WND_OFFSET) != 0 ||
+	     (fieldFlags & WINDOW_ORDER_FIELD_WND_SIZE) != 0 ||
+	     (fieldFlags & WINDOW_ORDER_FIELD_CLIENT_AREA_OFFSET) != 0 ||
+	     (fieldFlags & WINDOW_ORDER_FIELD_CLIENT_AREA_SIZE) != 0 ||
+	     (fieldFlags & WINDOW_ORDER_FIELD_WND_CLIENT_DELTA) != 0 ||
+	     (fieldFlags & WINDOW_ORDER_FIELD_VIS_OFFSET) != 0 ||
+	     (fieldFlags & WINDOW_ORDER_FIELD_VISIBILITY) != 0);
+
 	if (railWin->window)
 	{
-		if ((fieldFlags & WINDOW_ORDER_FIELD_WND_SIZE) || (fieldFlags & WINDOW_ORDER_FIELD_WND_OFFSET))
-			applySdlWindowGeometry(railWin);
+		if (fieldFlags & WINDOW_ORDER_FIELD_SHOW)
+		{
+			switch (state->showState)
+			{
+				case WINDOW_HIDE:
+					SDL_HideWindow(railWin->window);
+					break;
+				case WINDOW_SHOW_MINIMIZED:
+					SDL_MinimizeWindow(railWin->window);
+					break;
+				case WINDOW_SHOW_MAXIMIZED:
+					SDL_MaximizeWindow(railWin->window);
+					break;
+				default:
+					SDL_ShowWindow(railWin->window);
+					SDL_RestoreWindow(railWin->window);
+					break;
+			}
+		}
+
+		if (positionOrSizeUpdated)
+		{
+			/* The rail server likes to set minimized windows to a small hidden
+			 * size; avoid applying that so the window restores correctly. */
+			if (railWin->showState != WINDOW_SHOW_MINIMIZED)
+				applySdlWindowGeometry(railWin);
+
+			/* Force a full redraw of the window area after the layout changed
+			 * (the maximized-race workaround in xf_ShowWindow / xf_MoveWindow). */
+			if (railWin->isVisible && !railWin->isMinimized)
+			{
+				SDL_Rect full = { static_cast<int>(railWin->windowOffsetX),
+					              static_cast<int>(railWin->windowOffsetY),
+					              static_cast<int>(railWin->windowWidth),
+					              static_cast<int>(railWin->windowHeight) };
+				if (full.w > 0 && full.h > 0)
+				{
+					_sdl->push({ full });
+					if (!sdl_push_user_event(SDL_EVENT_USER_UPDATE))
+						return FALSE;
+				}
+			}
+		}
 
 		if (fieldFlags & WINDOW_ORDER_FIELD_TITLE)
 			updateSdlWindowState(railWin);
-
-		if ((fieldFlags & WINDOW_ORDER_FIELD_SHOW) &&
-		    state->showState == WINDOW_SHOW_MINIMIZED)
-			SDL_MinimizeWindow(railWin->window);
-		else if ((fieldFlags & WINDOW_ORDER_FIELD_SHOW) &&
-		         state->showState == WINDOW_SHOW_MAXIMIZED)
-			SDL_MaximizeWindow(railWin->window);
-		else if ((fieldFlags & WINDOW_ORDER_FIELD_SHOW) &&
-		         (state->showState == WINDOW_SHOW || state->showState == WINDOW_SHOW_MAXIMIZED))
-			SDL_RestoreWindow(railWin->window);
 	}
 
 	return TRUE;
@@ -1013,6 +1207,8 @@ BOOL SdlRail::updateMonitoredDesktop(rdpContext* ctx, const WINDOW_ORDER_INFO* o
 		{
 			if (client_rail_server_start_cmd(rail->_rail) != CHANNEL_RC_OK)
 				return FALSE;
+			if (!rail->sendWorkArea())
+				return FALSE;
 		}
 	}
 
@@ -1081,10 +1277,35 @@ UINT SdlRail::serverLocalMoveSize(RailClientContext* ctx,
 
 	std::lock_guard lock(rail->_mutex);
 	SdlRailWindow* railWin = rail->getWindow(localMoveSize->windowId);
-	if (!railWin)
+	if (!railWin || !railWin->window)
 		return CHANNEL_RC_OK;
 
-	railWin->railMoveInProgress = localMoveSize->isMoveSizeStart;
+	if (localMoveSize->isMoveSizeStart)
+	{
+		railWin->railMoveInProgress = true;
+		railWin->localMoveDirection = localMoveSize->moveSizeType;
+		SDL_GetGlobalMouseState(&railWin->localMovePointerStartX, &railWin->localMovePointerStartY);
+		SDL_GetWindowPosition(railWin->window, &railWin->localMoveStartX, &railWin->localMoveStartY);
+		SDL_GetWindowSize(railWin->window, &railWin->localMoveStartW, &railWin->localMoveStartH);
+
+		WLog_Print(rail->_sdl->getWLog(), WLOG_DEBUG,
+		           "RAIL local move/size start: win=%" PRIu64 " type=%u at [%d,%d] %dx%d",
+		           railWin->windowId, localMoveSize->moveSizeType, railWin->localMoveStartX,
+		           railWin->localMoveStartY, railWin->localMoveStartW, railWin->localMoveStartH);
+	}
+	else
+	{
+		railWin->railMoveInProgress = false;
+		railWin->localMoveDirection = 0;
+
+		WLog_Print(rail->_sdl->getWLog(), WLOG_DEBUG,
+		           "RAIL local move/size end: win=%" PRIu64, railWin->windowId);
+
+		/* Proactively report the final geometry so the server keeps in sync
+		 * even if no further WINDOW_MOVED/RESIZED event is delivered. */
+		if (!rail->sendWindowMove(railWin))
+			return CHANNEL_RC_OK;
+	}
 	return CHANNEL_RC_OK;
 }
 
