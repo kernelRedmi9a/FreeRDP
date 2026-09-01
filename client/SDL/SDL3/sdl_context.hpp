@@ -37,6 +37,7 @@
 #include "sdl_disp.hpp"
 #include "sdl_clip.hpp"
 #include "sdl_input.hpp"
+#include "sdl_rail.hpp"
 
 #include "dialogs/sdl_connection_dialog_wrapper.hpp"
 
@@ -129,6 +130,10 @@ class SdlContext
 	[[nodiscard]] sdlDispContext& getDisplayChannelContext();
 	[[nodiscard]] sdlInput& getInputChannelContext();
 	[[nodiscard]] sdlClip& getClipboardChannelContext();
+
+	[[nodiscard]] SdlRail* initRail(RailClientContext* rail);
+	[[nodiscard]] bool uninitRail();
+	[[nodiscard]] SdlRail* getRailContext();
 
 	[[nodiscard]] SdlConnectionDialogWrapper& getDialog();
 
@@ -232,6 +237,7 @@ class SdlContext
 	sdlDispContext _disp;
 	sdlInput _input;
 	sdlClip _clip;
+	std::unique_ptr<SdlRail> _rail;
 
 	SdlConnectionDialogWrapper _dialog;
 

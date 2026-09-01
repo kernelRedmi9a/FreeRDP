@@ -1037,6 +1037,39 @@ sdlClip& SdlContext::getClipboardChannelContext()
 	return _clip;
 }
 
+SdlRail* SdlContext::initRail(RailClientContext* rail)
+{
+	if (!rail)
+		return nullptr;
+
+	if (!_rail)
+		_rail = std::make_unique<SdlRail>(this);
+
+	if (!_rail->init(rail))
+	{
+		WLog_Print(_log, WLOG_ERROR, "Failed to initialize RAIL channel");
+		_rail.reset();
+		return nullptr;
+	}
+
+	return _rail.get();
+}
+
+bool SdlContext::uninitRail()
+{
+	if (!_rail)
+		return true;
+
+	bool rc = _rail->uninit();
+	_rail.reset();
+	return rc;
+}
+
+SdlRail* SdlContext::getRailContext()
+{
+	return _rail.get();
+}
+
 SdlConnectionDialogWrapper& SdlContext::getDialog()
 {
 	return _dialog;
@@ -1093,7 +1126,12 @@ bool SdlContext::handleEvent(const SDL_WindowEvent& ev)
 
 	auto window = getWindowForId(ev.windowID);
 	if (!window)
+	{
+		auto* rail = getRailContext();
+		if (rail)
+			return rail->handleEvent(ev);
 		return true;
+	}
 
 	{
 		const auto& r = window->rect();

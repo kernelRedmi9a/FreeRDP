@@ -240,6 +240,12 @@ static void sdl_term_handler([[maybe_unused]] int signum, [[maybe_unused]] const
 							rectangles = sdl->pop();
 							if (!sdl->drawToWindows(rectangles))
 								throw ErrorMsg{ -1, windowEvent.type, "sdl->drawToWindows" };
+							auto* rail = sdl->getRailContext();
+							if (rail && rail->isActive())
+							{
+								if (!rail->paint(rectangles))
+									throw ErrorMsg{ -1, windowEvent.type, "sdl->rail->paint" };
+							}
 						} while (!rectangles.empty());
 					}
 					break;

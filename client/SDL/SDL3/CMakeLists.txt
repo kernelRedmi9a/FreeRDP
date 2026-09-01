@@ -41,6 +41,8 @@ set(SRCS
     sdl_freerdp.cpp
     sdl_channels.hpp
     sdl_channels.cpp
+    sdl_rail.hpp
+    sdl_rail.cpp
     sdl_window.hpp
     sdl_window.cpp
     sdl_clip.hpp

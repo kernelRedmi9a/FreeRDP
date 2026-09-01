@@ -29,6 +29,7 @@
 #include "sdl_channels.hpp"
 #include "sdl_context.hpp"
 #include "sdl_disp.hpp"
+#include "sdl_rail.hpp"
 
 void sdl_OnChannelConnectedEventHandler(void* context, const ChannelConnectedEventArgs* e)
 {
@@ -39,6 +40,10 @@ void sdl_OnChannelConnectedEventHandler(void* context, const ChannelConnectedEve
 
 	if (strcmp(e->name, RAIL_SVC_CHANNEL_NAME) == 0)
 	{
+		auto rail = reinterpret_cast<RailClientContext*>(e->pInterface);
+		WINPR_ASSERT(rail);
+		if (!sdl->initRail(rail))
+			WLog_Print(sdl->getWLog(), WLOG_WARN, "Failed to initialize RAIL channel");
 	}
 	else if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0)
 	{
@@ -70,6 +75,8 @@ void sdl_OnChannelDisconnectedEventHandler(void* context, const ChannelDisconnec
 	// TODO: Set resizeable depending on disp channel and /dynamic-resolution
 	if (strcmp(e->name, RAIL_SVC_CHANNEL_NAME) == 0)
 	{
+		if (!sdl->uninitRail())
+			WLog_Print(sdl->getWLog(), WLOG_WARN, "Failed to uninitialize RAIL channel");
 	}
 	else if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0)
 	{
