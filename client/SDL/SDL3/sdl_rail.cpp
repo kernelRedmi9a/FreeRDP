@@ -22,15 +22,53 @@
 #include <winpr/assert.h>
 #include <winpr/wlog.h>
 
+#include <freerdp/client.h>
 #include <freerdp/client/rail.h>
+#include <freerdp/codec/color.h>
 #include <freerdp/log.h>
 
 #include "sdl_rail.hpp"
 #include "sdl_context.hpp"
+#include "sdl_prefs.hpp"
 #include "sdl_types.hpp"
 
 #include <algorithm>
 #include <cstring>
+
+[[nodiscard]] static UINT32 getInputKbdFlags()
+{
+	UINT32 flags = 0;
+	SDL_Keymod mod = SDL_GetModState();
+	if ((mod & SDL_KMOD_NUM) != 0)
+		flags |= KBD_SYNC_NUM_LOCK;
+	if ((mod & SDL_KMOD_CAPS) != 0)
+		flags |= KBD_SYNC_CAPS_LOCK;
+	if ((mod & SDL_KMOD_SCROLL) != 0)
+		flags |= KBD_SYNC_SCROLL_LOCK;
+	return flags;
+}
+
+[[nodiscard]] static bool sendRailWheel(SdlContext* sdl, UINT16 flags, INT32 avalue)
+{
+	WINPR_ASSERT(sdl);
+	if (avalue < 0)
+	{
+		flags |= PTR_FLAGS_WHEEL_NEGATIVE;
+		avalue = -avalue;
+	}
+
+	while (avalue > 0)
+	{
+		const UINT16 cval = (avalue > 0xFF) ? 0xFF : static_cast<UINT16>(avalue);
+		UINT16 cflags = flags | cval;
+		if (flags & PTR_FLAGS_WHEEL_NEGATIVE)
+			cflags = (flags & 0xFF00) | (0x100 - cval);
+		if (!freerdp_client_send_wheel_event(sdl->common(), cflags))
+			return false;
+		avalue -= cval;
+	}
+	return true;
+}
 
 static const char* exec_result_to_str(UINT32 code)
 {
@@ -94,6 +132,7 @@ bool SdlRail::uninit()
 	for (auto& [id, win] : _windows)
 		destroySdlWindow(win.get());
 	_windows.clear();
+	clearIconCache();
 	_remoteAppActive = false;
 	return true;
 }
@@ -138,6 +177,7 @@ bool SdlRail::disableRemoteAppMode()
 	for (auto& [id, win] : _windows)
 		destroySdlWindow(win.get());
 	_windows.clear();
+	clearIconCache();
 	return true;
 }
 
@@ -180,6 +220,11 @@ bool SdlRail::createSdlWindow(SdlRailWindow* railWin)
 	if (h < 1)
 		h = 480;
 
+	railWin->localOffsetX = railWin->windowOffsetX;
+	railWin->localOffsetY = railWin->windowOffsetY;
+	railWin->localWidth = static_cast<UINT32>(w);
+	railWin->localHeight = static_cast<UINT32>(h);
+
 	railWin->window = SDL_CreateWindow(title, w, h, flags);
 	if (!railWin->window)
 	{
@@ -191,6 +236,13 @@ bool SdlRail::createSdlWindow(SdlRailWindow* railWin)
 		SDL_MinimizeWindow(railWin->window);
 	else if (railWin->showState == WINDOW_SHOW_MAXIMIZED)
 		SDL_MaximizeWindow(railWin->window);
+
+	if (railWin->minTrackWidth > 0 && railWin->minTrackHeight > 0)
+		SDL_SetWindowMinimumSize(railWin->window, railWin->minTrackWidth,
+		                         railWin->minTrackHeight);
+	if (railWin->maxTrackWidth > 0 && railWin->maxTrackHeight > 0)
+		SDL_SetWindowMaximumSize(railWin->window, railWin->maxTrackWidth,
+		                         railWin->maxTrackHeight);
 
 	WLog_Print(_sdl->getWLog(), WLOG_DEBUG, "Created SDL window for rail %" PRIu64 " (%dx%d)",
 	           railWin->windowId, w, h);
@@ -215,6 +267,38 @@ bool SdlRail::updateSdlWindowState(SdlRailWindow* railWin)
 	if (!railWin->title.empty())
 		SDL_SetWindowTitle(railWin->window, railWin->title.c_str());
 
+	if (railWin->minTrackWidth > 0 && railWin->minTrackHeight > 0)
+		SDL_SetWindowMinimumSize(railWin->window, railWin->minTrackWidth,
+		                         railWin->minTrackHeight);
+	if (railWin->maxTrackWidth > 0 && railWin->maxTrackHeight > 0)
+		SDL_SetWindowMaximumSize(railWin->window, railWin->maxTrackWidth,
+		                         railWin->maxTrackHeight);
+
+	return true;
+}
+
+bool SdlRail::applySdlWindowGeometry(SdlRailWindow* railWin)
+{
+	if (!railWin || !railWin->window)
+		return true;
+
+	if (railWin->isMaximized || railWin->isMinimized)
+		return true;
+
+	const int w = static_cast<int>(railWin->windowWidth);
+	const int h = static_cast<int>(railWin->windowHeight);
+	if (w <= 0 || h <= 0)
+		return true;
+
+	/* Keep our local geometry in sync with the server requested one, so a
+	 * client-side move/resize only reports to the server when it really
+	 * differs from what the server expects. */
+	railWin->localOffsetX = railWin->windowOffsetX;
+	railWin->localOffsetY = railWin->windowOffsetY;
+
+	SDL_SetWindowSize(railWin->window, w, h);
+	railWin->localWidth = static_cast<UINT32>(w);
+	railWin->localHeight = static_cast<UINT32>(h);
 	return true;
 }
 
@@ -278,31 +362,345 @@ bool SdlRail::paint(const std::vector<SDL_Rect>& rects)
 
 bool SdlRail::handleEvent(const SDL_WindowEvent& ev)
 {
-	if (ev.type != SDL_EVENT_WINDOW_CLOSE_REQUESTED)
-		return true;
-
 	std::lock_guard lock(_mutex);
+
+	SdlRailWindow* railWin = nullptr;
 	for (auto& [id, win] : _windows)
 	{
 		if (win->window && win->window == SDL_GetWindowFromID(ev.windowID))
 		{
-			WLog_Print(_sdl->getWLog(), WLOG_DEBUG,
-			           "RAIL window %" PRIu64 " close requested, sending SC_CLOSE",
-			           win->windowId);
-			if (_rail && _rail->ClientSystemCommand)
-			{
-				RAIL_SYSCOMMAND_ORDER cmd = {};
-				cmd.windowId = static_cast<UINT32>(win->windowId);
-				cmd.command = SC_CLOSE;
-				const UINT rc = _rail->ClientSystemCommand(_rail, &cmd);
-				if (rc != CHANNEL_RC_OK)
-					WLog_Print(_sdl->getWLog(), WLOG_WARN,
-					           "Failed to send ClientSystemCommand: 0x%08" PRIX32, rc);
-			}
-			return true;
+			railWin = win.get();
+			break;
 		}
 	}
+
+	if (!railWin)
+		return true;
+
+	switch (ev.type)
+	{
+		case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+			WLog_Print(_sdl->getWLog(), WLOG_DEBUG,
+			           "RAIL window %" PRIu64 " close requested, sending SC_CLOSE",
+			           railWin->windowId);
+			return sendClientSystemCommand(railWin, SC_CLOSE);
+
+		case SDL_EVENT_WINDOW_MOVED:
+		case SDL_EVENT_WINDOW_RESIZED:
+			return sendWindowMove(railWin);
+
+		case SDL_EVENT_WINDOW_FOCUS_GAINED:
+			if (!_rail)
+				return true;
+			railWin->isActive = true;
+			{
+				auto* input = _sdl->context()->input;
+				const UINT32 syncFlags = getInputKbdFlags();
+				if (!freerdp_input_send_focus_in_event(
+				        input, WINPR_ASSERTING_INT_CAST(uint16_t, syncFlags)))
+					return false;
+			}
+			return sendClientActivate(railWin, true);
+
+		case SDL_EVENT_WINDOW_FOCUS_LOST:
+			if (!_rail)
+				return true;
+			railWin->isActive = false;
+			return sendClientActivate(railWin, false);
+
+		default:
+			return true;
+	}
+}
+
+bool SdlRail::isRailWindow(SDL_WindowID windowId) const
+{
+	std::lock_guard lock(_mutex);
+	const SDL_Window* w = SDL_GetWindowFromID(windowId);
+	if (!w)
+		return false;
+	for (auto& [id, win] : _windows)
+	{
+		if (win->window == w)
+			return true;
+	}
+	return false;
+}
+
+SdlRailWindow* SdlRail::getWindowForSdlWindow(SDL_WindowID windowId)
+{
+	std::lock_guard lock(_mutex);
+	const SDL_Window* w = SDL_GetWindowFromID(windowId);
+	if (!w)
+		return nullptr;
+	for (auto& [id, win] : _windows)
+	{
+		if (win->window == w)
+			return win.get();
+	}
+	return nullptr;
+}
+
+SdlRailWindow* SdlRail::getWindowForId(UINT64 id)
+{
+	std::lock_guard lock(_mutex);
+	return getWindow(id);
+}
+
+bool SdlRail::sendWindowMove(SdlRailWindow* railWin)
+{
+	if (!_rail || !railWin)
+		return true;
+
+	if (!railWin->isVisible || railWin->isMaximized || railWin->isMinimized)
+		return true;
+
+	if (railWin->railMoveInProgress)
+		return true;
+
+	int x = 0;
+	int y = 0;
+	SDL_GetWindowPosition(railWin->window, &x, &y);
+
+	int w = 0;
+	int h = 0;
+	SDL_GetWindowSize(railWin->window, &w, &h);
+
+	/* Only report to the server when the window actually moved/resized locally. */
+	if (x == railWin->localOffsetX && y == railWin->localOffsetY &&
+	    static_cast<UINT32>(w) == railWin->localWidth &&
+	    static_cast<UINT32>(h) == railWin->localHeight)
+		return true;
+
+	railWin->localOffsetX = x;
+	railWin->localOffsetY = y;
+	railWin->localWidth = static_cast<UINT32>(w);
+	railWin->localHeight = static_cast<UINT32>(h);
+
+	RAIL_WINDOW_MOVE_ORDER windowMove = {};
+	windowMove.windowId = static_cast<UINT32>(railWin->windowId);
+	windowMove.left = static_cast<INT16>(x - railWin->resizeMarginLeft);
+	windowMove.top = static_cast<INT16>(y - railWin->resizeMarginTop);
+	windowMove.right = static_cast<INT16>(x + w + railWin->resizeMarginRight);
+	windowMove.bottom = static_cast<INT16>(y + h + railWin->resizeMarginBottom);
+
+	if (!_rail->ClientWindowMove)
+		return true;
+
+	WLog_Print(_sdl->getWLog(), WLOG_DEBUG, "RAIL window move: %" PRIu64 " [%d,%d] %dx%d",
+	           railWin->windowId, windowMove.left, windowMove.top, w, h);
+
+	const UINT rc = _rail->ClientWindowMove(_rail, &windowMove);
+	if (rc != CHANNEL_RC_OK)
+	{
+		WLog_Print(_sdl->getWLog(), WLOG_WARN,
+		           "Failed to send ClientWindowMove: 0x%08" PRIX32, rc);
+		return false;
+	}
 	return true;
+}
+
+bool SdlRail::sendClientActivate(SdlRailWindow* railWin, bool enabled)
+{
+	if (!_rail || !railWin)
+		return true;
+
+	RAIL_ACTIVATE_ORDER activate = {};
+	activate.windowId = static_cast<UINT32>(railWin->windowId);
+	activate.enabled = enabled;
+	if (!_rail->ClientActivate)
+		return true;
+	const UINT rc = _rail->ClientActivate(_rail, &activate);
+	if (rc != CHANNEL_RC_OK)
+	{
+		WLog_Print(_sdl->getWLog(), WLOG_WARN, "Failed to send ClientActivate: 0x%08" PRIX32, rc);
+		return false;
+	}
+	return true;
+}
+
+bool SdlRail::sendClientSystemCommand(SdlRailWindow* railWin, UINT16 command)
+{
+	if (!_rail || !railWin)
+		return true;
+
+	RAIL_SYSCOMMAND_ORDER cmd = {};
+	cmd.windowId = static_cast<UINT32>(railWin->windowId);
+	cmd.command = command;
+	if (!_rail->ClientSystemCommand)
+		return true;
+	const UINT rc = _rail->ClientSystemCommand(_rail, &cmd);
+	if (rc != CHANNEL_RC_OK)
+	{
+		WLog_Print(_sdl->getWLog(), WLOG_WARN,
+		           "Failed to send ClientSystemCommand: 0x%08" PRIX32, rc);
+		return false;
+	}
+	return true;
+}
+
+SDL_Surface* SdlRail::decodeIcon(const ICON_INFO* iconInfo)
+{
+	if (!iconInfo)
+		return nullptr;
+
+	const UINT32 w = iconInfo->width;
+	const UINT32 h = iconInfo->height;
+	if (w == 0 || h == 0 || w > 512 || h > 512)
+		return nullptr;
+
+	BYTE* argb = static_cast<BYTE*>(calloc(static_cast<size_t>(w) * h, 4));
+	if (!argb)
+		return nullptr;
+
+	SDL_Surface* result = nullptr;
+	const BOOL ok = freerdp_image_copy_from_icon_data(
+	    argb, PIXEL_FORMAT_ARGB32, 0, 0, 0, static_cast<UINT16>(w), static_cast<UINT16>(h),
+	    iconInfo->bitsColor, iconInfo->cbBitsColor, iconInfo->bitsMask, iconInfo->cbBitsMask,
+	    iconInfo->colorTable, iconInfo->cbColorTable, iconInfo->bpp);
+
+	if (ok)
+	{
+		/* Create an owned surface and copy the decoded ARGB pixels into it,
+		 * so the surface can be safely cached independently. */
+		result = SDL_CreateSurface(static_cast<int>(w), static_cast<int>(h),
+		                           SDL_PIXELFORMAT_ARGB32);
+		if (result)
+		{
+			const int stride = result->pitch;
+			BYTE* dst = static_cast<BYTE*>(result->pixels);
+			for (UINT32 y = 0; y < h; y++)
+			{
+				memcpy(dst + static_cast<size_t>(y) * stride,
+				       argb + static_cast<size_t>(y) * w * 4,
+				       static_cast<size_t>(w) * 4);
+			}
+		}
+	}
+
+	free(argb);
+	return result;
+}
+
+SDL_Surface* SdlRail::getCachedIcon(const CACHED_ICON_INFO* cachedIcon)
+{
+	if (!cachedIcon)
+		return nullptr;
+
+	const UINT32 key = (cachedIcon->cacheId << 16) | cachedIcon->cacheEntry;
+	auto it = _iconCache.find(key);
+	if (it == _iconCache.end())
+		return nullptr;
+	return it->second;
+}
+
+void SdlRail::clearIconCache()
+{
+	for (auto& [key, surf] : _iconCache)
+		SDL_DestroySurface(surf);
+	_iconCache.clear();
+}
+
+bool SdlRail::setWindowIcon(SdlRailWindow* railWin, const ICON_INFO* iconInfo)
+{
+	if (!railWin || !railWin->window || !iconInfo)
+		return true;
+
+	SDL_Surface* surf = decodeIcon(iconInfo);
+	if (!surf)
+		return false;
+
+	const UINT32 key = (iconInfo->cacheId << 16) | iconInfo->cacheEntry;
+	auto it = _iconCache.find(key);
+	if (it == _iconCache.end())
+		_iconCache.emplace(key, surf);
+	else
+	{
+		/* replace existing entry */
+		SDL_DestroySurface(it->second);
+		it->second = surf;
+	}
+
+	SDL_SetWindowIcon(railWin->window, surf);
+	return true;
+}
+
+bool SdlRail::handleMouseMotion(SDL_WindowID windowId, const SDL_MouseMotionEvent& ev)
+{
+	SdlRailWindow* railWin = getWindowForSdlWindow(windowId);
+	if (!railWin || !_rail)
+		return true;
+
+	const INT32 x = static_cast<INT32>(ev.x) + railWin->windowOffsetX;
+	const INT32 y = static_cast<INT32>(ev.y) + railWin->windowOffsetY;
+	return freerdp_client_send_button_event(_sdl->common(), FALSE, PTR_FLAGS_MOVE, x, y);
+}
+
+bool SdlRail::handleMouseWheel(SDL_WindowID windowId, const SDL_MouseWheelEvent& ev)
+{
+	SdlRailWindow* railWin = getWindowForSdlWindow(windowId);
+	if (!railWin || !_rail)
+		return true;
+
+	const bool flipped =
+	    (ev.direction == SDL_MOUSEWHEEL_FLIPPED) &&
+	    !SdlPref::instance()->get_bool("UseLocalMouseScrollDirection");
+	const INT32 x = static_cast<INT32>(ev.x * (flipped ? -1.0f : 1.0f) * 120.0f);
+	const INT32 y = static_cast<INT32>(ev.y * (flipped ? -1.0f : 1.0f) * 120.0f);
+
+	bool ok = true;
+	if (y != 0)
+		ok = sendRailWheel(_sdl, PTR_FLAGS_WHEEL, y) && ok;
+	if (x != 0)
+		ok = sendRailWheel(_sdl, PTR_FLAGS_HWHEEL, x) && ok;
+	return ok;
+}
+
+bool SdlRail::handleMouseButton(SDL_WindowID windowId, const SDL_MouseButtonEvent& ev)
+{
+	SdlRailWindow* railWin = getWindowForSdlWindow(windowId);
+	if (!railWin || !_rail)
+		return true;
+
+	UINT16 flags = 0;
+	UINT16 xflags = 0;
+
+	if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN)
+	{
+		flags |= PTR_FLAGS_DOWN;
+		xflags |= PTR_XFLAGS_DOWN;
+	}
+
+	switch (ev.button)
+	{
+		case 1:
+			flags |= PTR_FLAGS_BUTTON1;
+			break;
+		case 2:
+			flags |= PTR_FLAGS_BUTTON3;
+			break;
+		case 3:
+			flags |= PTR_FLAGS_BUTTON2;
+			break;
+		case 4:
+			xflags |= PTR_XFLAGS_BUTTON1;
+			break;
+		case 5:
+			xflags |= PTR_XFLAGS_BUTTON2;
+			break;
+		default:
+			break;
+	}
+
+	const INT32 x = static_cast<INT32>(ev.x) + railWin->windowOffsetX;
+	const INT32 y = static_cast<INT32>(ev.y) + railWin->windowOffsetY;
+
+	if ((flags & (~PTR_FLAGS_DOWN)) != 0)
+		return freerdp_client_send_button_event(_sdl->common(), FALSE, flags, x, y);
+	else if ((xflags & (~PTR_XFLAGS_DOWN)) != 0)
+		return freerdp_client_send_extended_button_event(_sdl->common(), FALSE, xflags, x, y);
+	else
+		return true;
 }
 
 bool SdlRail::windowCommonHandler(rdpContext* ctx, const WINDOW_ORDER_INFO* order,
@@ -422,15 +820,20 @@ bool SdlRail::windowCommonHandler(rdpContext* ctx, const WINDOW_ORDER_INFO* orde
 		railWin->isMaximized = (state->showState == WINDOW_SHOW_MAXIMIZED);
 	}
 
+	if (fieldFlags & WINDOW_ORDER_FIELD_VISIBILITY)
+	{
+		railWin->visibilityRects.clear();
+		if (state->numVisibilityRects > 0 && state->visibilityRects)
+		{
+			railWin->visibilityRects.assign(state->visibilityRects,
+			                                state->visibilityRects + state->numVisibilityRects);
+		}
+	}
+
 	if (railWin->window)
 	{
 		if ((fieldFlags & WINDOW_ORDER_FIELD_WND_SIZE) || (fieldFlags & WINDOW_ORDER_FIELD_WND_OFFSET))
-		{
-			int w = static_cast<int>(railWin->windowWidth);
-			int h = static_cast<int>(railWin->windowHeight);
-			if (w > 0 && h > 0)
-				SDL_SetWindowSize(railWin->window, w, h);
-		}
+			applySdlWindowGeometry(railWin);
 
 		if (fieldFlags & WINDOW_ORDER_FIELD_TITLE)
 			updateSdlWindowState(railWin);
@@ -446,6 +849,26 @@ bool SdlRail::windowCommonHandler(rdpContext* ctx, const WINDOW_ORDER_INFO* orde
 			SDL_RestoreWindow(railWin->window);
 	}
 
+	return TRUE;
+}
+
+bool SdlRail::windowIconHandler(rdpContext* ctx, const WINDOW_ORDER_INFO* order,
+                                const ICON_INFO* iconInfo)
+{
+	if (!ctx || !order || !iconInfo)
+		return FALSE;
+
+	SdlRailWindow* railWin = getWindow(order->windowId);
+	if (!railWin)
+		return TRUE;
+
+	return setWindowIcon(railWin, iconInfo);
+}
+
+bool SdlRail::notifyIconHandler(WINPR_ATTR_UNUSED const WINDOW_ORDER_INFO* order,
+                                WINPR_ATTR_UNUSED const NOTIFY_ICON_STATE_ORDER* state)
+{
+	/* Notify icons (tray) are not represented as SDL windows. Nothing to do here. */
 	return TRUE;
 }
 
@@ -479,33 +902,83 @@ BOOL SdlRail::updateWindowDelete(rdpContext* ctx, const WINDOW_ORDER_INFO* order
 }
 
 BOOL SdlRail::updateWindowIcon(rdpContext* ctx, const WINDOW_ORDER_INFO* order,
-                               WINPR_ATTR_UNUSED const WINDOW_ICON_ORDER* icon)
+                               const WINDOW_ICON_ORDER* icon)
 {
-	(void)ctx;
-	(void)order;
-	return TRUE;
+	if (!ctx || !order || !icon)
+		return FALSE;
+
+	auto sdl = get_context(ctx);
+	if (!sdl)
+		return FALSE;
+
+	auto rail = sdl->getRailContext();
+	if (!rail)
+		return FALSE;
+
+	std::lock_guard lock(rail->_mutex);
+	return rail->windowIconHandler(ctx, order, icon->iconInfo);
 }
 
 BOOL SdlRail::updateWindowCachedIcon(rdpContext* ctx, const WINDOW_ORDER_INFO* order,
-                                     WINPR_ATTR_UNUSED const WINDOW_CACHED_ICON_ORDER* icon)
+                                     const WINDOW_CACHED_ICON_ORDER* icon)
 {
-	(void)ctx;
-	(void)order;
+	if (!ctx || !order || !icon)
+		return FALSE;
+
+	auto sdl = get_context(ctx);
+	if (!sdl)
+		return FALSE;
+
+	auto rail = sdl->getRailContext();
+	if (!rail)
+		return FALSE;
+
+	std::lock_guard lock(rail->_mutex);
+	SdlRailWindow* railWin = rail->getWindow(order->windowId);
+	if (!railWin || !railWin->window)
+		return TRUE;
+
+	SDL_Surface* surf = rail->getCachedIcon(&icon->cachedIcon);
+	if (!surf)
+	{
+		WLog_Print(sdl->getWLog(), WLOG_DEBUG,
+		           "RAIL cached icon %02X:%04X not found, ignoring",
+		           icon->cachedIcon.cacheId, icon->cachedIcon.cacheEntry);
+		return TRUE;
+	}
+
+	SDL_SetWindowIcon(railWin->window, surf);
 	return TRUE;
 }
 
-BOOL SdlRail::updateNotifyIconCreate(WINPR_ATTR_UNUSED rdpContext* ctx,
-                                     WINPR_ATTR_UNUSED const WINDOW_ORDER_INFO* order,
-                                     WINPR_ATTR_UNUSED const NOTIFY_ICON_STATE_ORDER* state)
+BOOL SdlRail::updateNotifyIconCreate(rdpContext* ctx, const WINDOW_ORDER_INFO* order,
+                                     const NOTIFY_ICON_STATE_ORDER* state)
 {
-	return TRUE;
+	if (!ctx)
+		return FALSE;
+	auto sdl = get_context(ctx);
+	if (!sdl)
+		return FALSE;
+	auto rail = sdl->getRailContext();
+	if (!rail)
+		return FALSE;
+	std::lock_guard lock(rail->_mutex);
+	return rail->notifyIconHandler(order, state);
 }
 
-BOOL SdlRail::updateNotifyIconUpdate(WINPR_ATTR_UNUSED rdpContext* ctx,
-                                     WINPR_ATTR_UNUSED const WINDOW_ORDER_INFO* order,
-                                     WINPR_ATTR_UNUSED const NOTIFY_ICON_STATE_ORDER* state)
+BOOL SdlRail::updateNotifyIconUpdate(rdpContext* ctx, const WINDOW_ORDER_INFO* order,
+                                     const NOTIFY_ICON_STATE_ORDER* state)
 {
-	return TRUE;
+	if (!ctx)
+		return FALSE;
+	auto sdl = get_context(ctx);
+	if (!sdl)
+		return FALSE;
+	auto rail = sdl->getRailContext();
+	if (!rail)
+		return FALSE;
+	std::lock_guard lock(rail->_mutex);
+	return rail->notifyIconHandler(order, state);
 }
 
 BOOL SdlRail::updateNotifyIconDelete(WINPR_ATTR_UNUSED rdpContext* ctx,
@@ -587,18 +1060,63 @@ UINT SdlRail::serverExecuteResult(RailClientContext* ctx,
 UINT SdlRail::serverSystemParam(WINPR_ATTR_UNUSED RailClientContext* ctx,
                                 WINPR_ATTR_UNUSED const RAIL_SYSPARAM_ORDER* sysparam)
 {
+	/* The server may send a work area or other system parameters. SDL3 has no
+	 * trivial mapping for all of them, so we accept them and ignore what we
+	 * cannot represent. */
 	return CHANNEL_RC_OK;
 }
 
-UINT SdlRail::serverLocalMoveSize(WINPR_ATTR_UNUSED RailClientContext* ctx,
-                                  WINPR_ATTR_UNUSED const RAIL_LOCALMOVESIZE_ORDER* localMoveSize)
+UINT SdlRail::serverLocalMoveSize(RailClientContext* ctx,
+                                  const RAIL_LOCALMOVESIZE_ORDER* localMoveSize)
 {
+	if (!ctx || !localMoveSize)
+		return ERROR_INVALID_PARAMETER;
+
+	auto rail = static_cast<SdlRail*>(ctx->custom);
+	if (!rail || !rail->_sdl)
+		return ERROR_INVALID_PARAMETER;
+
+	if (localMoveSize->windowId > UINT32_MAX)
+		return ERROR_INVALID_PARAMETER;
+
+	std::lock_guard lock(rail->_mutex);
+	SdlRailWindow* railWin = rail->getWindow(localMoveSize->windowId);
+	if (!railWin)
+		return CHANNEL_RC_OK;
+
+	railWin->railMoveInProgress = localMoveSize->isMoveSizeStart;
 	return CHANNEL_RC_OK;
 }
 
-UINT SdlRail::serverMinMaxInfo(WINPR_ATTR_UNUSED RailClientContext* ctx,
-                               WINPR_ATTR_UNUSED const RAIL_MINMAXINFO_ORDER* minMaxInfo)
+UINT SdlRail::serverMinMaxInfo(RailClientContext* ctx, const RAIL_MINMAXINFO_ORDER* minMaxInfo)
 {
+	if (!ctx || !minMaxInfo)
+		return ERROR_INVALID_PARAMETER;
+
+	auto rail = static_cast<SdlRail*>(ctx->custom);
+	if (!rail || !rail->_sdl)
+		return ERROR_INVALID_PARAMETER;
+
+	std::lock_guard lock(rail->_mutex);
+	SdlRailWindow* railWin = rail->getWindow(minMaxInfo->windowId);
+	if (!railWin)
+		return CHANNEL_RC_OK;
+
+	railWin->minTrackWidth = minMaxInfo->minTrackWidth;
+	railWin->minTrackHeight = minMaxInfo->minTrackHeight;
+	railWin->maxTrackWidth = minMaxInfo->maxTrackWidth;
+	railWin->maxTrackHeight = minMaxInfo->maxTrackHeight;
+
+	if (railWin->window)
+	{
+		if (railWin->minTrackWidth > 0 && railWin->minTrackHeight > 0)
+			SDL_SetWindowMinimumSize(railWin->window, railWin->minTrackWidth,
+			                         railWin->minTrackHeight);
+		if (railWin->maxTrackWidth > 0 && railWin->maxTrackHeight > 0)
+			SDL_SetWindowMaximumSize(railWin->window, railWin->maxTrackWidth,
+			                         railWin->maxTrackHeight);
+	}
+
 	return CHANNEL_RC_OK;
 }
 

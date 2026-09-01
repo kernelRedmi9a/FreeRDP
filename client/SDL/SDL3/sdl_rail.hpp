@@ -60,13 +60,28 @@ struct SdlRailWindow
 	INT32 resizeMarginRight = 0;
 	INT32 resizeMarginBottom = 0;
 
+	/* Local window geometry (may diverge from the server requested one
+	 * when the user moves/resizes the window locally). */
+	INT32 localOffsetX = 0;
+	INT32 localOffsetY = 0;
+	UINT32 localWidth = 0;
+	UINT32 localHeight = 0;
+
+	INT32 minTrackWidth = 0;
+	INT32 minTrackHeight = 0;
+	INT32 maxTrackWidth = 0;
+	INT32 maxTrackHeight = 0;
+
 	std::string title;
+	std::vector<RECTANGLE_16> visibilityRects;
 
 	SDL_Window* window = nullptr;
 
 	bool isVisible = false;
 	bool isMinimized = false;
 	bool isMaximized = false;
+	bool isActive = false;
+	bool railMoveInProgress = false;
 };
 
 class SdlRail
@@ -86,6 +101,16 @@ class SdlRail
 	bool paint(const std::vector<SDL_Rect>& rects);
 	bool handleEvent(const SDL_WindowEvent& ev);
 
+	// Input routed to a RAIL window (coords are window-local, translated to
+	// the virtual desktop before forwarding to the server).
+	bool handleMouseMotion(SDL_WindowID windowId, const SDL_MouseMotionEvent& ev);
+	bool handleMouseButton(SDL_WindowID windowId, const SDL_MouseButtonEvent& ev);
+	bool handleMouseWheel(SDL_WindowID windowId, const SDL_MouseWheelEvent& ev);
+
+	[[nodiscard]] bool isRailWindow(SDL_WindowID windowId) const;
+	[[nodiscard]] SdlRailWindow* getWindowForSdlWindow(SDL_WindowID windowId);
+	[[nodiscard]] SdlRailWindow* getWindowForId(UINT64 id);
+
 	[[nodiscard]] RailClientContext* railContext() const { return _rail; }
 	[[nodiscard]] bool isActive() const { return _remoteAppActive; }
 
@@ -97,9 +122,18 @@ class SdlRail
 	bool destroySdlWindow(SdlRailWindow* railWin);
 	bool updateSdlWindowState(SdlRailWindow* railWin);
 	bool paintWindow(SdlRailWindow* railWin, const std::vector<SDL_Rect>& rects);
+	bool applySdlWindowGeometry(SdlRailWindow* railWin);
 
 	bool enableRemoteAppMode();
 	bool disableRemoteAppMode();
+
+	bool sendWindowMove(SdlRailWindow* railWin);
+	bool sendClientActivate(SdlRailWindow* railWin, bool enabled);
+	bool sendClientSystemCommand(SdlRailWindow* railWin, UINT16 command);
+	bool setWindowIcon(SdlRailWindow* railWin, const ICON_INFO* iconInfo);
+	SDL_Surface* getCachedIcon(const CACHED_ICON_INFO* cachedIcon);
+	SDL_Surface* decodeIcon(const ICON_INFO* iconInfo);
+	void clearIconCache();
 
 	// Server callbacks (RDP thread)
 	static UINT serverExecuteResult(RailClientContext* ctx,
@@ -132,12 +166,17 @@ class SdlRail
 
 	bool windowCommonHandler(rdpContext* ctx, const WINDOW_ORDER_INFO* order,
 	                         const WINDOW_STATE_ORDER* state);
+	bool windowIconHandler(rdpContext* ctx, const WINDOW_ORDER_INFO* order,
+	                       const ICON_INFO* iconInfo);
+	bool notifyIconHandler(WINPR_ATTR_UNUSED const WINDOW_ORDER_INFO* order,
+	                       WINPR_ATTR_UNUSED const NOTIFY_ICON_STATE_ORDER* state);
 
 	static void registerUpdateCallbacks(rdpUpdate* update);
 
 	SdlContext* _sdl;
 	RailClientContext* _rail = nullptr;
 	std::map<UINT64, std::unique_ptr<SdlRailWindow>> _windows;
-	std::mutex _mutex;
+	std::map<UINT32, SDL_Surface*> _iconCache;
+	mutable std::mutex _mutex;
 	bool _remoteAppActive = false;
 };

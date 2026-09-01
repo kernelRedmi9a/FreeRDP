@@ -1094,6 +1094,10 @@ bool SdlContext::moveMouseTo(const SDL_FPoint& pos)
 
 bool SdlContext::handleEvent(const SDL_MouseMotionEvent& ev)
 {
+	auto* rail = getRailContext();
+	if (rail && rail->isRailWindow(ev.windowID))
+		return rail->handleMouseMotion(ev.windowID, ev);
+
 	if (!getWindowForId(ev.windowID))
 		return true; /* Event for an untracked window (e.g. closed dialog) */
 	SDL_Event copy{};
@@ -1109,6 +1113,10 @@ bool SdlContext::handleEvent(const SDL_MouseMotionEvent& ev)
 
 bool SdlContext::handleEvent(const SDL_MouseWheelEvent& ev)
 {
+	auto* rail = getRailContext();
+	if (rail && rail->isRailWindow(ev.windowID))
+		return rail->handleMouseWheel(ev.windowID, ev);
+
 	if (!getWindowForId(ev.windowID))
 		return true;
 	SDL_Event copy{};
@@ -1227,6 +1235,10 @@ bool SdlContext::handleEvent(const SDL_DisplayEvent& ev)
 
 bool SdlContext::handleEvent(const SDL_MouseButtonEvent& ev)
 {
+	auto* rail = getRailContext();
+	if (rail && rail->isRailWindow(ev.windowID))
+		return rail->handleMouseButton(ev.windowID, ev);
+
 	if (!getWindowForId(ev.windowID))
 		return true;
 	SDL_Event copy = {};
