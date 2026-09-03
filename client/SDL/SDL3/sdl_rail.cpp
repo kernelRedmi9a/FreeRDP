@@ -129,9 +129,11 @@ bool SdlRail::uninit()
 		_rail = nullptr;
 	}
 
+	/* The worker (RDP) thread must not call SDL_DestroyWindow here: it would
+	 * race with the main thread's SDL event/render loop and crash at teardown.
+	 * Release the window handles only. SDL owns the native windows and tears
+	 * them down (SDL_Quit) on the main thread. */
 	std::lock_guard lock(_mutex);
-	for (auto& [id, win] : _windows)
-		destroySdlWindow(win.get());
 	_windows.clear();
 	clearIconCache();
 	_remoteAppActive = false;
@@ -195,9 +197,9 @@ bool SdlRail::disableRemoteAppMode()
 	if (gdi)
 		gdi->suppressOutput = FALSE;
 
+	/* Do not SDL_DestroyWindow from the worker thread (races the event loop);
+	 * just release the handles and let SDL tear the windows down. */
 	std::lock_guard lock(_mutex);
-	for (auto& [id, win] : _windows)
-		destroySdlWindow(win.get());
 	_windows.clear();
 	clearIconCache();
 	return true;
