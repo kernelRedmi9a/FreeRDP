@@ -68,6 +68,8 @@ struct test_peer_context
 	RdpsndServerContext* rdpsnd;
 	EncomspServerContext* encomsp;
 
+	struct _sfRailServer* rail;
+
 	rdpTransportIo io;
 	wImage* image;
 };

@@ -208,17 +208,29 @@ bool SdlRail::sendWorkArea()
 	if (!_rail || !_rail->ClientSystemParam)
 		return true;
 
-	/* Report the usable area of the display the window is on so the server
-	 * maximizes RemoteApp windows within the panel (like _NET_WORKAREA). */
-	SDL_Rect usable{};
-	const SDL_DisplayID display = SDL_GetPrimaryDisplay();
-	if (!SDL_GetDisplayUsableBounds(display, &usable))
+	/* Report the usable area across all monitors so the server maximizes
+	 * RemoteApp windows within the union (like _NET_WORKAREA). */
+	int numDisplays = 0;
+	const SDL_DisplayID* displays = SDL_GetDisplays(&numDisplays);
+	if (!displays || numDisplays <= 0)
 		return true;
 
-	const RECTANGLE_16 workArea = { WINPR_ASSERTING_INT_CAST(UINT16, usable.x),
-		                            WINPR_ASSERTING_INT_CAST(UINT16, usable.y),
-		                            WINPR_ASSERTING_INT_CAST(UINT16, usable.x + usable.w),
-		                            WINPR_ASSERTING_INT_CAST(UINT16, usable.y + usable.h) };
+	SDL_Rect unionBounds{};
+	for (int i = 0; i < numDisplays; i++)
+	{
+		SDL_Rect usable{};
+		if (SDL_GetDisplayUsableBounds(displays[i], &usable))
+			SDL_GetRectUnion(&unionBounds, &usable, &unionBounds);
+	}
+	SDL_free(const_cast<SDL_DisplayID*>(displays));
+
+	if (unionBounds.w <= 0 || unionBounds.h <= 0)
+		return true;
+
+	const RECTANGLE_16 workArea = { WINPR_ASSERTING_INT_CAST(UINT16, unionBounds.x),
+		                            WINPR_ASSERTING_INT_CAST(UINT16, unionBounds.y),
+		                            WINPR_ASSERTING_INT_CAST(UINT16, unionBounds.x + unionBounds.w),
+		                            WINPR_ASSERTING_INT_CAST(UINT16, unionBounds.y + unionBounds.h) };
 
 	if (workArea.left == _workArea.left && workArea.top == _workArea.top &&
 	    workArea.right == _workArea.right && workArea.bottom == _workArea.bottom)
@@ -228,8 +240,8 @@ bool SdlRail::sendWorkArea()
 	sysparam.params = static_cast<UINT32>(SPI_MASK_SET_WORK_AREA);
 	sysparam.workArea = workArea;
 
-	WLog_Print(_sdl->getWLog(), WLOG_DEBUG, "RAIL sending work area %d,%d %dx%d", usable.x,
-	           usable.y, usable.w, usable.h);
+	WLog_Print(_sdl->getWLog(), WLOG_DEBUG, "RAIL sending work area %d,%d %dx%d",
+	           unionBounds.x, unionBounds.y, unionBounds.w, unionBounds.h);
 	const UINT rc = _rail->ClientSystemParam(_rail, &sysparam);
 	if (rc == CHANNEL_RC_OK)
 		_workArea = workArea;
@@ -356,6 +368,7 @@ bool SdlRail::applySdlWindowGeometry(SdlRailWindow* railWin)
 	railWin->localOffsetY = railWin->windowOffsetY;
 
 	SDL_SetWindowSize(railWin->window, w, h);
+	SDL_SetWindowPosition(railWin->window, railWin->windowOffsetX, railWin->windowOffsetY);
 	railWin->localWidth = static_cast<UINT32>(w);
 	railWin->localHeight = static_cast<UINT32>(h);
 	return true;
@@ -669,18 +682,38 @@ bool SdlRail::setWindowIcon(SdlRailWindow* railWin, const ICON_INFO* iconInfo)
 	if (!surf)
 		return false;
 
-	const UINT32 key = (iconInfo->cacheId << 16) | iconInfo->cacheEntry;
-	auto it = _iconCache.find(key);
-	if (it == _iconCache.end())
-		_iconCache.emplace(key, surf);
-	else
+	/* cacheId == 0xFF means "do not cache" — use the decoded surface directly
+	 * and destroy it after setting the window icon.  Everything else goes into
+	 * the icon cache.  The cache is bounded to 64 entries to mirror the RAIL
+	 * server-side icon cache sizing. */
+	const bool donotcache = (iconInfo->cacheId == 0xFF);
+
+	if (!donotcache)
 	{
-		/* replace existing entry */
-		SDL_DestroySurface(it->second);
-		it->second = surf;
+		const UINT32 key = (iconInfo->cacheId << 16) | iconInfo->cacheEntry;
+		auto it = _iconCache.find(key);
+		if (it == _iconCache.end())
+		{
+			/* Evict the oldest entry when the cache is full. */
+			if (_iconCache.size() >= 64)
+			{
+				auto victim = _iconCache.begin();
+				SDL_DestroySurface(victim->second);
+				_iconCache.erase(victim);
+			}
+			_iconCache.emplace(key, surf);
+		}
+		else
+		{
+			SDL_DestroySurface(it->second);
+			it->second = surf;
+		}
 	}
 
 	SDL_SetWindowIcon(railWin->window, surf);
+
+	if (donotcache)
+		SDL_DestroySurface(surf);
 	return true;
 }
 
@@ -1241,8 +1274,10 @@ UINT SdlRail::serverExecuteResult(RailClientContext* ctx,
 	if (!rail || !rail->_sdl)
 		return ERROR_INVALID_PARAMETER;
 
-	WLog_Print(rail->_sdl->getWLog(), WLOG_INFO, "RAIL exec result: %s [0x%08" PRIx32 "]",
-	           exec_result_to_str(execResult->execResult), execResult->execResult);
+	WLog_Print(rail->_sdl->getWLog(), WLOG_INFO,
+	           "RAIL exec result: %s [0x%08" PRIx32 "] rawResult=0x%08" PRIx32,
+	           exec_result_to_str(execResult->execResult), execResult->execResult,
+	           execResult->rawResult);
 
 	if (execResult->execResult != RAIL_EXEC_S_OK)
 	{

@@ -27,6 +27,8 @@ set(SRCS
     sf_rdpsnd.h
     sf_encomsp.c
     sf_encomsp.h
+    sf_rail.c
+    sf_rail.h
 )
 
 if(CHANNEL_AINPUT_SERVER)

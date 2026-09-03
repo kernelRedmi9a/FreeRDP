@@ -81,20 +81,25 @@ void sdl_OnChannelDisconnectedEventHandler(void* context, const ChannelDisconnec
 	else if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0)
 	{
 		auto clip = reinterpret_cast<CliprdrClientContext*>(e->pInterface);
-		WINPR_ASSERT(clip);
-
-		if (!sdl->getClipboardChannelContext().uninit(clip))
-			WLog_Print(sdl->getWLog(), WLOG_WARN, "Failed to uninitialize clipboard channel");
-		clip->custom = nullptr;
+		/* During error teardown a channel may be unconnected (failed
+		 * post_connect), in which case pInterface is NULL. The channel libs
+		 * accept NULL, so only touch it through them. */
+		if (clip)
+		{
+			if (!sdl->getClipboardChannelContext().uninit(clip))
+				WLog_Print(sdl->getWLog(), WLOG_WARN, "Failed to uninitialize clipboard channel");
+			clip->custom = nullptr;
+		}
 	}
 	else if (strcmp(e->name, DISP_DVC_CHANNEL_NAME) == 0)
 	{
 		auto disp = reinterpret_cast<DispClientContext*>(e->pInterface);
-		WINPR_ASSERT(disp);
-
-		if (!sdl->getDisplayChannelContext().uninit(disp))
-			WLog_Print(sdl->getWLog(), WLOG_WARN, "Failed to uninitialize display channel");
-		disp->custom = nullptr;
+		if (disp)
+		{
+			if (!sdl->getDisplayChannelContext().uninit(disp))
+				WLog_Print(sdl->getWLog(), WLOG_WARN, "Failed to uninitialize display channel");
+			disp->custom = nullptr;
+		}
 	}
 	else
 		freerdp_client_OnChannelDisconnectedEventHandler(context, e);

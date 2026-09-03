@@ -52,6 +52,7 @@
 #include "sf_audin.h"
 #include "sf_rdpsnd.h"
 #include "sf_encomsp.h"
+#include "sf_rail.h"
 
 #include "sfreerdp.h"
 
@@ -104,6 +105,7 @@ static void test_peer_context_free(freerdp_peer* client, rdpContext* ctx)
 
 		rdpsnd_server_context_free(context->rdpsnd);
 		encomsp_server_context_free(context->encomsp);
+		sf_peer_rail_uninit(context);
 
 		WTSCloseServer(context->vcm);
 	}
@@ -740,10 +742,12 @@ static BOOL tf_peer_post_connect(freerdp_peer* client)
 
 	/* A real server should tag the peer as activated here and start sending updates in main loop.
 	 */
+	/* The legacy demo icon is only required for the old window sprite animation.
+	 * In RemoteApp/RAIL mode (or when no image decoder is built in) it is not
+	 * needed to proceed, so a failure here is non-fatal. */
 	if (!test_peer_load_icon(client))
 	{
-		WLog_DBG(TAG, "Unable to load icon");
-		return FALSE;
+		WLog_WARN(TAG, "Unable to load demo icon; continuing without it");
 	}
 
 	if (WTSVirtualChannelManagerIsChannelJoined(context->vcm, "rdpdbg"))
@@ -780,6 +784,12 @@ static BOOL tf_peer_post_connect(freerdp_peer* client)
 	if (WTSVirtualChannelManagerIsChannelJoined(context->vcm, ENCOMSP_SVC_CHANNEL_NAME))
 	{
 		if (!sf_peer_encomsp_init(context)) /* Lync Multiparty */
+			return FALSE;
+	}
+
+	if (WTSVirtualChannelManagerIsChannelJoined(context->vcm, RAIL_SVC_CHANNEL_NAME))
+	{
+		if (!sf_peer_rail_init(context)) /* RemoteApp / RAIL */
 			return FALSE;
 	}
 
@@ -1186,6 +1196,19 @@ static DWORD WINAPI test_peer_mainloop(LPVOID arg)
 	if (!freerdp_settings_set_bool(settings, FreeRDP_NSCodec, TRUE) ||
 	    !freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32))
 		goto fail;
+
+	{
+		const UINT32 mask =
+		    RAIL_LEVEL_SUPPORTED | RAIL_LEVEL_DOCKED_LANGBAR_SUPPORTED |
+		    RAIL_LEVEL_SHELL_INTEGRATION_SUPPORTED | RAIL_LEVEL_LANGUAGE_IME_SYNC_SUPPORTED |
+		    RAIL_LEVEL_SERVER_TO_CLIENT_IME_SYNC_SUPPORTED |
+		    RAIL_LEVEL_HIDE_MINIMIZED_APPS_SUPPORTED | RAIL_LEVEL_WINDOW_CLOAKING_SUPPORTED |
+		    RAIL_LEVEL_HANDSHAKE_EX_SUPPORTED;
+		if (!freerdp_settings_set_uint32(settings, FreeRDP_RemoteApplicationSupportLevel, mask))
+			goto fail;
+		if (!freerdp_settings_set_bool(settings, FreeRDP_RemoteAppLanguageBarSupported, TRUE))
+			goto fail;
+	}
 
 	if (!freerdp_settings_set_bool(settings, FreeRDP_SuppressOutput, TRUE))
 		goto fail;

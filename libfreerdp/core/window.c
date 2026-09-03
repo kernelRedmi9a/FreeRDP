@@ -575,20 +575,21 @@ static BOOL window_order_supported(const rdpSettings* settings, UINT32 fieldFlag
 	const BOOL dresult =
 	    freerdp_settings_get_bool(settings, FreeRDP_AllowUnanouncedOrdersFromServer);
 
-	switch (freerdp_settings_get_uint32(settings, FreeRDP_RemoteWndSupportLevel))
-	{
-		case WINDOW_LEVEL_SUPPORTED_EX:
-			return TRUE;
+	/*
+	 * The negotiated support level is a bitmask of the individual levels
+	 * (settings.c initializes it to WINDOW_LEVEL_SUPPORTED | WINDOW_LEVEL_SUPPORTED_EX),
+	 * and any level other than NOT_SUPPORTED enables window orders (see orders.c).
+	 */
+	const UINT32 supportLevel =
+	    freerdp_settings_get_uint32(settings, FreeRDP_RemoteWndSupportLevel);
 
-		case WINDOW_LEVEL_SUPPORTED:
-			return ((fieldFlags & mask) == 0) || dresult;
+	if (supportLevel & WINDOW_LEVEL_SUPPORTED_EX)
+		return TRUE;
 
-		case WINDOW_LEVEL_NOT_SUPPORTED:
-			return dresult;
+	if (supportLevel & WINDOW_LEVEL_SUPPORTED)
+		return ((fieldFlags & mask) == 0) || dresult;
 
-		default:
-			return dresult;
-	}
+	return dresult;
 }
 
 #define DUMP_APPEND(buffer, size, ...)                  \
